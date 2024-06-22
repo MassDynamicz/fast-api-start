@@ -1,0 +1,13 @@
+fastapi
+fastapi-users[sqlalchemy,oauth]
+uvicorn
+sqlalchemy
+sqlalchemy-utils
+pydantic
+aiosqlite
+asyncpg
+asyncio
+aiofiles
+jinja2
+alembic
+passlib[bcrypt]
