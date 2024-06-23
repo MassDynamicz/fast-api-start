@@ -1,36 +1,20 @@
 # main.py
-from fastapi import Request, Form, HTTPException, status
+from fastapi import Request, HTTPException, status
 from config.settings import app, templates
 from api.auth.routes.users import router as users_router
-from api.auth.routes.sessions import router as sessions_router
 from api.auth.routes.roles import router as roles_router
+from api.auth.routes.login import router as login_router
 from fastapi.responses import JSONResponse
 
+app.include_router(login_router, tags=["Авторизация"])
 app.include_router(users_router, prefix="/users",tags=["Пользователи"])
-app.include_router(sessions_router, prefix="/sessions",tags=["Сессии"])
-app.include_router(roles_router, prefix="/roles", tags=["Роли"])
+app.include_router(roles_router, prefix="/roles", tags=["Роли и права доступа"])
 
 # root
-@app.get("/", tags=["Шаблоны"])
+@app.get("/", tags=["Страницы"])
 async def read_root(request: Request):
     data = {"request": request, "title": 'Главная Expeditor'}
     return templates.TemplateResponse("index.html", data)
-
-# @app.get("/login/", tags=["Авторизация"])
-# async def login_page(request: Request):
-#     data = {"request": request, "title": 'Страница авторизации'}
-#     return templates.TemplateResponse("/users/login.html", data)
-
-@app.post("/login/", tags=["Авторизация"])
-async def login_for_access_token(request: Request, username: str = Form(...), password: str = Form(...)):
-    user = fake_users_db.get(username)
-    if not user or user["password"] != password:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
-        )
-    # Возвращаем простой токен
-    return JSONResponse(content={"access_token": user["token"], "token_type": "bearer"})
 
 if __name__ == "__main__":
     import uvicorn

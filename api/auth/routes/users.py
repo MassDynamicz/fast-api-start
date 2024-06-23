@@ -1,120 +1,199 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 from config.db import get_db
-from api.auth import models, schemas
+from api.auth.models import User, Role, Permission
+from api.auth.schemas import UserCreate,UserUpdate, User as UserSchema
 from config.utils import get_password_hash
-from typing import List
 from datetime import datetime
+from typing import List
 
 router = APIRouter()
 
-@router.post("/", response_model=schemas.User)
-async def create_user(user: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
-    try:
-        result = await db.execute(select(models.User).filter_by(email=user.email))
-        db_user = result.scalars().first()
-        if db_user:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        
-        if not user.roles:
-            raise HTTPException(status_code=400, detail="User must have at least one role")
-        
-        roles = []
-        for role_id in user.roles:
-            role_result = await db.execute(select(models.Role).filter_by(id=role_id))
-            role = role_result.scalars().first()
-            if not role:
-                raise HTTPException(status_code=404, detail=f"Role with id {role_id} not found")
-            roles.append(role)
-        
-        hashed_password = get_password_hash(user.password)
-        is_admin = any(role.name == "admin" for role in roles)
-        db_user = models.User(
-            username=user.username,
-            email=user.email,
-            first_name=user.first_name,
-            last_name=user.last_name,
-            phone=user.phone,
-            address=user.address,
-            company=user.company,
-            is_active=user.is_active,
-            is_admin=is_admin,
-            hashed_password=hashed_password,
-            last_login_at=datetime.utcnow()
-        )
-        
-        db_user.roles = roles
-        
-        db.add(db_user)
+#получаем или добавляем роли
+async def get_or_create_role(db: AsyncSession, role_name: str, permissions: List[Permission] = None) -> Role:
+    result = await db.execute(select(Role).filter_by(name=role_name))
+    role = result.scalars().first()
+    if not role:
+        role = Role(name=role_name, description=f"{role_name.capitalize()} role")
+        if permissions:
+            role.permissions.extend(permissions)
+        db.add(role)
         await db.commit()
-        await db.refresh(db_user)
-        return schemas.User.from_orm(db_user)
-    except Exception as e:
-        print(f"Error creating user: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+    return role
 
-@router.get("/", response_model=List[schemas.User])
-async def read_users(skip: int = 0, limit: int = 10, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(models.User).offset(skip).limit(limit))
-    users = result.scalars().all()
-    return [schemas.User.from_orm(user) for user in users]
+#получаем или добавляем права доступа
+async def get_or_create_permission(db: AsyncSession, name: str, description: str) -> Permission:
+    result = await db.execute(select(Permission).filter_by(name=name))
+    permission = result.scalars().first()
+    if not permission:
+        permission = Permission(name=name, description=description)
+        db.add(permission)
+        await db.commit()
+    return permission
 
-@router.get("/{user_id}", response_model=schemas.User)
-async def read_user(user_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(models.User).filter_by(id=user_id))
-    user = result.scalars().first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    return schemas.User.from_orm(user)
+# Инициализируем первичного пользователя
+async def create_initial_user(db: AsyncSession):
+    result = await db.execute(select(User))
+    users_exist = result.scalars().first()
+    if not users_exist:
+        permissions = [
+            await get_or_create_permission(db, "create", "Создание"),
+            await get_or_create_permission(db, "read", "Просмотр"),
+            await get_or_create_permission(db, "update", "Редактирование"),
+            await get_or_create_permission(db, "delete", "Удаление")
+        ]
+        admin_role = await get_or_create_role(db, "admin", permissions)
+        initial_user = User(
+            username="admin",
+            first_name="",
+            last_name="",
+            email="admin@mail.com",
+            phone="",
+            address="",
+            company="",
+            status=True,
+            login_date=datetime.utcnow(),
+            hashed_password=get_password_hash("admin"),
+            role=admin_role
+        )
+        db.add(initial_user)
+        try:
+            await db.commit()
+            print("Пользователь-администратор создан")
+        except IntegrityError:
+            await db.rollback()
+            print("Первичный админ существует")
+    else:
+        print("Таблица с пользователями существует. Запуск приложения...")
 
-@router.put("/{user_id}", response_model=schemas.User)
-async def update_user(user_id: int, user: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
+#определяем роль по умолчанию
+async def get_default_role(db: AsyncSession) -> Role:
+    return await get_or_create_role(db, "user", [await get_or_create_permission(db, "read_own", "Просмотр собственных данных")])
+
+async def load_user_relations(user: User, db: AsyncSession):
+    user_role = await db.execute(select(Role).options(selectinload(Role.permissions)).filter(Role.id == user.role_id))
+    user.role = user_role.scalars().first()
+    user_sessions = await db.execute(select(User).options(selectinload(User.sessions)).filter(User.id == user.id))
+    user.sessions = user_sessions.scalars().first().sessions
+
+
+@router.post("/", response_model=UserSchema)
+async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
     try:
-        result = await db.execute(select(models.User).filter_by(id=user_id))
+        result = await db.execute(select(User).filter((User.username == user.username) | (User.email == user.email)))
+        existing_user = result.scalars().first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Пользователь существует")
+
+        new_user_data = user.dict(exclude={"password"})  # Исключаем пароль
+        new_user_data["hashed_password"] = get_password_hash(user.password)  # Хэшируем пароль
+        new_user_data["login_date"] = datetime.utcnow()
+
+        if not new_user_data.get("role_id"):
+            default_role = await get_default_role(db)
+            new_user_data["role_id"] = default_role.id
+            print(f"Присвоена роль 'user' с id: {default_role.id} для нового пользователя")
+
+        new_user = User(**new_user_data)
+        db.add(new_user)
+        await db.commit()
+        await db.refresh(new_user)
+
+        await load_user_relations(new_user, db)
+        print(f"Создан новый пользователь: {new_user.username}")
+
+        return new_user
+    except IntegrityError as e:
+        await db.rollback()
+        print(f"Ошибка создания пользователя из-за ошибки целостности: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
+    except Exception as e:
+        print(f"Неожиданная ошибка при создании пользователя: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    
+# Список пользователей
+@router.get("/", response_model=List[UserSchema])
+async def read_users(skip: int = 0, limit: int = 10, db: AsyncSession = Depends(get_db)):
+    try:
+        result = await db.execute(
+            select(User)
+            .options(selectinload(User.role).selectinload(Role.permissions))
+            .options(selectinload(User.sessions))
+            .offset(skip).limit(limit)
+        )
+        users = result.scalars().all()
+        return [UserSchema.from_orm(user) for user in users]
+    except Exception as e:
+        print(f"Ошибка чтения пользователей: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to read users: {str(e)}")
+
+# Данные пользователя
+@router.get("/{user_id}", response_model=UserSchema)
+async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
+    try:
+        result = await db.execute(
+            select(User)
+            .options(selectinload(User.role).selectinload(Role.permissions))
+            .options(selectinload(User.sessions))
+            .filter(User.id == user_id)
+        )
+        user = result.scalars().first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+        return UserSchema.from_orm(user)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Обновить пользователя
+@router.patch("/{user_id}", response_model=UserSchema)
+async def update_user(user_id: int, user: UserUpdate, db: AsyncSession = Depends(get_db)):
+    try:
+        result = await db.execute(select(User).options(selectinload(User.role), selectinload(User.sessions)).filter(User.id == user_id))
         db_user = result.scalars().first()
-        if db_user is None:
-            raise HTTPException(status_code=404, detail="User not found")
 
-        user_data = user.dict(exclude_unset=True)
-        
-        # Логирование значений, которые будут обновлены
-        print(f"Updating user {user_id} with data: {user_data}")
+        if not db_user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
 
-        for key, value in user_data.items():
-            if key == "password":
-                value = get_password_hash(value)
+        update_data = user.dict(exclude_unset=True)
+        if "password" in update_data:
+            update_data["hashed_password"] = get_password_hash(update_data.pop("password"))
+
+        for key, value in update_data.items():
             setattr(db_user, key, value)
 
-        if "roles" in user_data:
-            roles = []
-            for role_id in user_data["roles"]:
-                role_result = await db.execute(select(models.Role).filter_by(id=role_id))
-                role = role_result.scalars().first()
-                if not role:
-                    raise HTTPException(status_code=404, detail=f"Role with id {role_id} not found")
-                roles.append(role)
-            db_user.roles = roles
-            db_user.is_admin = any(role.name == "admin" for role in roles)
-
         await db.commit()
         await db.refresh(db_user)
-        return schemas.User.from_orm(db_user)
-    except Exception as e:
-        print(f"Error updating user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@router.delete("/{user_id}", response_model=schemas.User)
+        await load_user_relations(db_user, db)
+        
+        return db_user
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Удалить пользователя
+@router.delete("/{user_id}", response_model=UserSchema)
 async def delete_user(user_id: int, db: AsyncSession = Depends(get_db)):
     try:
-        result = await db.execute(select(models.User).filter_by(id=user_id))
-        db_user = result.scalars().first()
-        if db_user is None:
-            raise HTTPException(status_code=404, detail="User not found")
+        result = await db.execute(select(User).options(selectinload(User.role), selectinload(User.sessions)).filter(User.id == user_id))
+        user = result.scalars().first()
 
-        await db.delete(db_user)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+        # Открепляем связанные данные
+        user.role = None
+        user.sessions = []
+
+        await db.delete(user)
         await db.commit()
-        return schemas.User.from_orm(db_user)
+
+        return user
     except Exception as e:
-        print(f"Error deleting user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))

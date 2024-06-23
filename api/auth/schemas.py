@@ -1,58 +1,91 @@
+# auth/schemas.py
+from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
-from typing import List, Optional
 
+# Permission Schemas
+class PermissionBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+class PermissionCreate(PermissionBase):
+    pass
+
+class Permission(PermissionBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+# Role Schemas
 class RoleBase(BaseModel):
     name: str
-    description: str
+    description: Optional[str] = None
 
 class RoleCreate(RoleBase):
     pass
 
 class Role(RoleBase):
     id: int
+    permissions: List[Permission] = []
 
     class Config:
         from_attributes = True
 
+# UserSession Schemas
 class UserSessionBase(BaseModel):
-    session_start: datetime
-    session_end: Optional[datetime]
-    data_used: int
-    description: str
+    token: str
+    session_start: Optional[datetime] = None
+    session_end: Optional[datetime] = None
+    traffic: Optional[int] = 0
+    description: Optional[str] = None
+
+class UserSessionCreate(UserSessionBase):
+    pass
 
 class UserSession(UserSessionBase):
     id: int
+    user_id: int
 
     class Config:
         from_attributes = True
 
+# User Schemas
 class UserBase(BaseModel):
-    id: int
     username: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     email: str
-    first_name: str
-    last_name: str
-    phone: str
-    address: str
-    company: str
-    is_active: bool
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    company: Optional[str] = None
+    status: Optional[bool] = True
+    login_date: Optional[datetime] = None
+    role_id: Optional[int] = None
 
 class UserCreate(UserBase):
     password: str
-    roles: List[int]
+
+class UserUpdate(UserBase):
+    username: Optional[str]
+    first_name: Optional[str]
+    last_name: Optional[str]
+    email: Optional[str]
+    phone: Optional[str]
+    address: Optional[str]
+    company: Optional[str]
+    status: Optional[bool]
+    password: Optional[str]
 
 class User(UserBase):
     id: int
-    last_login_at: datetime
-    is_admin: bool
-    roles: List[Role] = []
+    role: Optional[Role] = None
     sessions: List[UserSession] = []
 
     class Config:
         from_attributes = True
 
-    @staticmethod
-    def from_orm(user):
-        user_dict = user.__dict__
-        return User(**user_dict)
+# Login Schema
+class Login(BaseModel):
+    username: str
+    password: str
